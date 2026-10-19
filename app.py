@@ -1,5 +1,7 @@
+
 import io
 import os
+import hashlib
 import tempfile
 import urllib.request
 
@@ -22,8 +24,12 @@ st.set_page_config(
 )
 
 st.title("Squat Biomechanics Lab")
-st.caption("시상면 스쿼트 동작분석 | 조건별 3회 | 평균 ± SD")
+st.caption(
+    "2D 시상면 스쿼트 운동학 분석 | "
+    "영상별 바벨 길이 보정 | 조건별 평균 ± SD"
+)
 
+MODEL_PATH = "/tmp/pose_landmarker_full.task"
 MODEL_URL = (
     "https://storage.googleapis.com/"
     "mediapipe-models/pose_landmarker/"
@@ -31,72 +37,66 @@ MODEL_URL = (
     "pose_landmarker_full.task"
 )
 
-MODEL_PATH = "/tmp/pose_landmarker_full.task"
-
 if "results" not in st.session_state:
     st.session_state.results = {}
 
 @st.cache_resource
-def get_model_path():
+def model_path():
     if not os.path.exists(MODEL_PATH):
-        urllib.request.urlretrieve(
-            MODEL_URL, MODEL_PATH
-        )
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
     return MODEL_PATH
 
-def read_video(file_bytes):
+@st.cache_data(show_spinner=False, max_entries=12)
+def load_video(file_bytes, suffix=".mp4"):
     with tempfile.NamedTemporaryFile(
-        suffix=".mp4", delete=False
+        suffix=suffix, delete=False
     ) as f:
         f.write(file_bytes)
-        filename = f.name
+        path = f.name
 
-    cap = cv2.VideoCapture(filename)
+    cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     frames = []
 
-    while True:
-        ok, image = cap.read()
-        if not ok:
-            break
-        frames.append(image)
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+    finally:
+        cap.release()
+        os.unlink(path)
 
-    cap.release()
-    os.remove(filename)
-
-    if not frames or fps <= 0:
-        raise ValueError("영상을 읽을 수 없습니다.")
+    if not frames or not np.isfinite(fps) or fps <= 0:
+        raise ValueError("영상 읽기 실패 또는 FPS 정보 오류")
 
     return frames, float(fps)
 
-def first_frame(file_bytes):
-    with tempfile.NamedTemporaryFile(
-        suffix=".mp4", delete=False
-    ) as f:
-        f.write(file_bytes)
-        filename = f.name
+def show_click_image(frame, key, marks=None):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
 
-    cap = cv2.VideoCapture(filename)
-    ok, frame = cap.read()
-    cap.release()
-    os.remove(filename)
+    if marks:
+        for label, point, color in marks:
+            if point is not None:
+                p = tuple(np.round(point).astype(int))
+                cv2.circle(rgb, p, 7, color, -1)
+                cv2.putText(
+                    rgb, label, (p[0]+8, p[1]-8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, color, 2
+                )
 
-    if not ok:
-        raise ValueError("첫 프레임을 읽을 수 없습니다.")
-
-    return frame
-
-def pick_point(frame, key):
-    h, w = frame.shape[:2]
     shown_w = min(w, 650)
-    shown_h = int(h * shown_w / w)
+    shown_h = round(h * shown_w / w)
 
-    image = Image.fromarray(
-        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    ).resize((shown_w, shown_h))
+    pil = Image.fromarray(rgb).resize(
+        (shown_w, shown_h)
+    )
 
     response = streamlit_image_coordinates(
-        image, key=key
+        pil, key=key
     )
 
     if response is None:
@@ -107,140 +107,106 @@ def pick_point(frame, key):
         response["y"] * h / shown_h
     ], dtype=float)
 
-def calculate_angle(a, b, c):
-    u = a - b
-    v = c - b
-
-    numerator = np.sum(u * v, axis=1)
-    denominator = (
-        np.linalg.norm(u, axis=1)
-        * np.linalg.norm(v, axis=1)
-    )
-
-    cosine = np.divide(
-        numerator,
-        denominator,
-        out=np.full(len(numerator), np.nan),
-        where=denominator > 1e-10
-    )
-
-    return np.degrees(
-        np.arccos(np.clip(cosine, -1, 1))
-    )
-
-def clean_signal(values, fps):
-    s = pd.Series(values, dtype=float)
-
-    s = s.interpolate(
+def filter_signal(values, fps):
+    arr = pd.Series(
+        values, dtype=float
+    ).interpolate(
         limit=3, limit_area="inside"
-    )
+    ).to_numpy()
 
-    values = s.to_numpy()
-    valid = np.isfinite(values)
-    result = values.copy()
-
+    good = np.isfinite(arr)
     starts = np.where(
-        valid & ~np.r_[False, valid[:-1]]
+        good & ~np.r_[False, good[:-1]]
     )[0]
     ends = np.where(
-        valid & ~np.r_[valid[1:], False]
+        good & ~np.r_[good[1:], False]
     )[0]
 
+    result = arr.copy()
     window = max(5, int(fps * 0.15) | 1)
 
     for a, b in zip(starts, ends):
-        length = b - a + 1
+        length = b-a+1
         win = min(
             window,
-            length if length % 2 else length - 1
+            length if length % 2 else length-1
         )
-
         if win >= 5:
             result[a:b+1] = savgol_filter(
-                values[a:b+1], win, 2
+                arr[a:b+1], win, 2
             )
-
     return result
 
-def calculate_velocity(values, time):
-    result = np.full(len(values), np.nan)
-    valid = np.isfinite(values)
+def angle_2d(a, b, c):
+    u = a-b
+    v = c-b
+    dot = np.sum(u*v, axis=1)
+    length = (
+        np.linalg.norm(u, axis=1)
+        * np.linalg.norm(v, axis=1)
+    )
+    cos = np.divide(
+        dot, length,
+        out=np.full(len(dot), np.nan),
+        where=length > 1e-10
+    )
+    return np.degrees(
+        np.arccos(np.clip(cos, -1, 1))
+    )
 
+def velocity(values, time):
+    arr = np.asarray(values, dtype=float)
+    result = np.full(len(arr), np.nan)
+
+    good = np.isfinite(arr)
     starts = np.where(
-        valid & ~np.r_[False, valid[:-1]]
+        good & ~np.r_[False, good[:-1]]
     )[0]
     ends = np.where(
-        valid & ~np.r_[valid[1:], False]
+        good & ~np.r_[good[1:], False]
     )[0]
 
     for a, b in zip(starts, ends):
         if b > a:
             result[a:b+1] = np.gradient(
-                values[a:b+1], time[a:b+1]
+                arr[a:b+1], time[a:b+1]
             )
-
     return result
 
-def track_barbell(frames, initial):
-    result = np.full((len(frames), 2), np.nan)
-    result[0] = initial
-
-    prev = cv2.cvtColor(
-        frames[0], cv2.COLOR_BGR2GRAY
-    )
-    prev_point = np.array(
-        [[initial]], dtype=np.float32
+def get_range(values):
+    arr = np.asarray(values, dtype=float)
+    if not np.isfinite(arr).any():
+        return np.nan
+    return float(
+        np.nanmax(arr)-np.nanmin(arr)
     )
 
-    for i in range(1, len(frames)):
-        current = cv2.cvtColor(
-            frames[i], cv2.COLOR_BGR2GRAY
-        )
+def get_max(values, absolute=False):
+    arr = np.asarray(values, dtype=float)
+    if absolute:
+        arr = np.abs(arr)
+    if not np.isfinite(arr).any():
+        return np.nan
+    return float(np.nanmax(arr))
 
-        next_point, status, error = (
-            cv2.calcOpticalFlowPyrLK(
-                prev, current, prev_point, None,
-                winSize=(31, 31),
-                maxLevel=3
-            )
-        )
+@st.cache_data(show_spinner=False, max_entries=12)
+def extract_pose(file_bytes, suffix, fps):
+    frames, native_fps = load_video(
+        file_bytes, suffix
+    )
 
-        if (
-            next_point is None
-            or status is None
-            or status[0, 0] != 1
-        ):
-            break
-
-        point = next_point.reshape(2)
-        last = prev_point.reshape(2)
-
-        if np.linalg.norm(point - last) > 80:
-            break
-
-        result[i] = point
-        prev_point = next_point.reshape(1, 1, 2)
-        prev = current
-
-    return result
-
-def analyze_video(
-    file_bytes, fps_override,
-    scale, bar_point, side
-):
-    frames, native_fps = read_video(file_bytes)
-    fps = fps_override if fps_override > 0 else native_fps
+    coords = np.full(
+        (len(frames), 33, 2), np.nan
+    )
 
     options = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(
-            model_asset_path=get_model_path()
+            model_asset_path=model_path()
         ),
         running_mode=vision.RunningMode.VIDEO,
-        num_poses=1
-    )
-
-    landmarks = np.full(
-        (len(frames), 33, 2), np.nan
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5
     )
 
     with vision.PoseLandmarker.create_from_options(
@@ -249,7 +215,6 @@ def analyze_video(
 
         for i, frame in enumerate(frames):
             h, w = frame.shape[:2]
-
             rgb = cv2.cvtColor(
                 frame, cv2.COLOR_BGR2RGB
             )
@@ -259,682 +224,843 @@ def analyze_video(
                 data=np.ascontiguousarray(rgb)
             )
 
-            prediction = detector.detect_for_video(
-                image, int(round(i * 1000 / fps))
+            result = detector.detect_for_video(
+                image, int(round(i*1000/fps))
             )
 
-            if not prediction.pose_landmarks:
+            if not result.pose_landmarks:
                 continue
 
-            pose = prediction.pose_landmarks[0]
-
-            for j, p in enumerate(pose):
+            for j, p in enumerate(
+                result.pose_landmarks[0]
+            ):
                 if p.visibility >= 0.5:
-                    landmarks[i, j] = [
-                        p.x * w, p.y * h
+                    coords[i,j] = [
+                        p.x*w, p.y*h
                     ]
 
-    time = np.arange(len(frames)) / fps
+    return coords
 
-    ids = {
-        "left": [11, 23, 25, 27, 31],
-        "right": [12, 24, 26, 28, 32]
-    }
+def track_bar(frames, start_point):
+    points = np.full(
+        (len(frames), 2), np.nan
+    )
+    points[0] = start_point
 
-    shoulder, hip, knee, ankle, toe = ids[side]
-
-    points = {}
-    for j in [shoulder, hip, knee, ankle, toe]:
-        points[j] = np.column_stack([
-            clean_signal(landmarks[:, j, 0], fps),
-            clean_signal(landmarks[:, j, 1], fps)
-        ])
-
-    pelvis = np.nanmean(
-        landmarks[:, [23, 24], :],
-        axis=1
+    prev_gray = cv2.cvtColor(
+        frames[0], cv2.COLOR_BGR2GRAY
+    )
+    prev_pt = np.array(
+        [[start_point]], dtype=np.float32
     )
 
-    for axis in range(2):
-        pelvis[:, axis] = clean_signal(
-            pelvis[:, axis], fps
+    for i in range(1, len(frames)):
+        gray = cv2.cvtColor(
+            frames[i], cv2.COLOR_BGR2GRAY
         )
 
-    barbell = track_barbell(frames, bar_point)
+        nxt, status, err = cv2.calcOpticalFlowPyrLK(
+            prev_gray, gray, prev_pt, None,
+            winSize=(31,31), maxLevel=3
+        )
+
+        if nxt is None or status is None:
+            break
+        if status[0,0] != 1:
+            break
+
+        p = nxt.reshape(2)
+        if not np.isfinite(p).all():
+            break
+        if np.linalg.norm(
+            p-prev_pt.reshape(2)
+        ) > 80:
+            break
+
+        points[i] = p
+        prev_pt = nxt.reshape(1,1,2)
+        prev_gray = gray
+
+    return points
+
+def analyze(
+    file_bytes, suffix, fps, scale,
+    start, bottom, end, bar_point, side
+):
+    frames, _ = load_video(
+        file_bytes, suffix
+    )
+
+    if not 0 <= start < bottom < end < len(frames):
+        raise ValueError(
+            "시작 < 최저점 < 종료 순서로 설정하세요."
+        )
+
+    coords = extract_pose(
+        file_bytes, suffix, fps
+    )[start:end+1].copy()
+
+    segment_frames = frames[start:end+1]
+    n = len(segment_frames)
+    t = np.arange(n)/fps
+
+    ids = {
+        "left": [11,23,25,27,31],
+        "right": [12,24,26,28,32]
+    }
+    sh, hip, knee, ankle, toe = ids[side]
+
+    points = {}
+    for j in [sh, hip, knee, ankle, toe]:
+        points[j] = np.column_stack([
+            filter_signal(coords[:,j,0], fps),
+            filter_signal(coords[:,j,1], fps)
+        ])
+
+    # 골반 중심 = 좌우 고관절 중점
+    pelvis = np.full((n,2), np.nan)
+    both = np.isfinite(
+        coords[:,[23,24],:]
+    ).all(axis=(1,2))
+
+    pelvis[both] = (
+        coords[both,23,:]
+        + coords[both,24,:]
+    )/2
 
     for axis in range(2):
-        barbell[:, axis] = clean_signal(
-            barbell[:, axis], fps
+        pelvis[:,axis] = filter_signal(
+            pelvis[:,axis], fps
+        )
+
+    bar = track_bar(
+        segment_frames,
+        np.asarray(bar_point, dtype=float)
+    )
+    for axis in range(2):
+        bar[:,axis] = filter_signal(
+            bar[:,axis], fps
         )
 
     def displacement(p):
-        # 영상 X 오른쪽 양수 / 수직 위쪽 양수
-        # 최초 유효 프레임을 기준으로 변위 계산
-        valid = np.isfinite(p).all(axis=1)
-        if not valid.any():
-            return np.full_like(p, np.nan)
-        origin = p[np.where(valid)[0][0]]
-        return np.column_stack([
-            (p[:, 0] - origin[0]) * scale,
-            -(p[:, 1] - origin[1]) * scale
-        ])
+        out = np.full_like(p, np.nan)
+        good = np.isfinite(p).all(axis=1)
+
+        if not good.any():
+            return out
+
+        first = np.where(good)[0][0]
+        out[:,0] = (
+            p[:,0]-p[first,0]
+        )*scale
+        out[:,1] = -(
+            p[:,1]-p[first,1]
+        )*scale
+        return out
 
     pelvis_d = displacement(pelvis)
-    bar_d = displacement(barbell)
+    bar_d = displacement(bar)
 
-    knee_flex = 180 - calculate_angle(
-        points[hip], points[knee], points[ankle]
+    knee_angle = 180-angle_2d(
+        points[hip],points[knee],points[ankle]
     )
-    hip_angle = calculate_angle(
-        points[shoulder], points[hip],
-        points[knee]
+    hip_angle = angle_2d(
+        points[sh],points[hip],points[knee]
     )
-    ankle_angle = calculate_angle(
-        points[knee], points[ankle],
-        points[toe]
+    ankle_angle = angle_2d(
+        points[knee],points[ankle],points[toe]
     )
 
-    trunk = points[shoulder] - points[hip]
+    trunk = points[sh]-points[hip]
     trunk_angle = np.degrees(
-        np.arctan2(trunk[:, 0], -trunk[:, 1])
+        np.arctan2(
+            trunk[:,0],-trunk[:,1]
+        )
     )
 
     df = pd.DataFrame({
-        "frame": np.arange(len(frames)),
-        "time_s": time,
-        "knee_flexion_deg": knee_flex,
+        "frame": np.arange(start,end+1),
+        "time_s": t,
+        "knee_flexion_deg": knee_angle,
         "hip_segment_deg": hip_angle,
         "ankle_segment_deg": ankle_angle,
         "trunk_inclination_deg": trunk_angle,
-        "pelvis_x_m": pelvis_d[:, 0],
-        "pelvis_y_m": pelvis_d[:, 1],
-        "bar_x_m": bar_d[:, 0],
-        "bar_y_m": bar_d[:, 1]
+        "pelvis_x_m": pelvis_d[:,0],
+        "pelvis_y_m": pelvis_d[:,1],
+        "bar_x_m": bar_d[:,0],
+        "bar_y_m": bar_d[:,1]
     })
 
-    for name in ["pelvis", "bar"]:
-        for axis in ["x", "y"]:
+    for name in ["pelvis","bar"]:
+        for axis in ["x","y"]:
             col = f"{name}_{axis}_m"
-            df[f"{name}_v{axis}_ms"] = (
-                calculate_velocity(
-                    df[col].to_numpy(), time
-                )
+            df[f"{name}_v{axis}_ms"] = velocity(
+                df[col].to_numpy(),t
             )
 
-    vertical = df.pelvis_y_m.to_numpy()
+    bottom_relative = bottom-start
 
-    if np.isfinite(vertical).sum() < 5:
-        raise ValueError(
-            "골반 좌표가 충분히 검출되지 않았습니다."
-        )
-
-    bottom = int(np.nanargmin(vertical))
-
-    if bottom < 2 or bottom > len(df) - 3:
-        raise ValueError(
-            "최저점 검출 실패. 영상 구간을 확인하세요."
-        )
-
-    # 하강 0~50%, 상승 50~100%
-    phase = np.empty(len(df))
-    phase[:bottom+1] = np.linspace(
-        0, 50, bottom+1
+    # 하강과 상승을 각각 50%로 정규화
+    phase = np.empty(n)
+    phase[:bottom_relative+1] = np.linspace(
+        0,50,bottom_relative+1
     )
-    phase[bottom:] = np.linspace(
-        50, 100, len(df)-bottom
+    phase[bottom_relative:] = np.linspace(
+        50,100,n-bottom_relative
     )
     df["phase_pct"] = phase
 
-    def data_range(values):
-        v = np.asarray(values, dtype=float)
-        return (
-            np.nanmax(v) - np.nanmin(v)
-            if np.isfinite(v).any()
-            else np.nan
-        )
-
-    def abs_max(values):
-        v = np.asarray(values, dtype=float)
-        return (
-            np.nanmax(np.abs(v))
-            if np.isfinite(v).any()
-            else np.nan
-        )
-
     summary = {
-        "max_knee_flexion_deg": np.nanmax(knee_flex),
-        "knee_ROM_deg": data_range(knee_flex),
-        "hip_segment_ROM_deg": data_range(hip_angle),
-        "ankle_segment_ROM_deg": data_range(ankle_angle),
-        "max_trunk_inclination_deg": abs_max(trunk_angle),
+        "max_knee_flexion_deg":
+            get_max(knee_angle),
+        "knee_ROM_deg":
+            get_range(knee_angle),
+        "hip_segment_ROM_deg":
+            get_range(hip_angle),
+        "ankle_segment_ROM_deg":
+            get_range(ankle_angle),
+        "max_trunk_inclination_deg":
+            get_max(trunk_angle,True),
+
         "pelvis_vertical_range_cm":
-            data_range(pelvis_d[:, 1]) * 100,
+            get_range(pelvis_d[:,1])*100,
         "pelvis_AP_range_cm":
-            data_range(pelvis_d[:, 0]) * 100,
+            get_range(pelvis_d[:,0])*100,
         "bar_vertical_range_cm":
-            data_range(bar_d[:, 1]) * 100,
+            get_range(bar_d[:,1])*100,
         "bar_AP_range_cm":
-            data_range(bar_d[:, 0]) * 100,
+            get_range(bar_d[:,0])*100,
+
         "max_pelvis_vertical_speed_ms":
-            abs_max(df.pelvis_vy_ms),
+            get_max(df.pelvis_vy_ms,True),
         "max_pelvis_AP_speed_ms":
-            abs_max(df.pelvis_vx_ms),
+            get_max(df.pelvis_vx_ms,True),
         "max_bar_vertical_speed_ms":
-            abs_max(df.bar_vy_ms),
+            get_max(df.bar_vy_ms,True),
         "max_bar_AP_speed_ms":
-            abs_max(df.bar_vx_ms),
-        "descent_time_s": time[bottom],
-        "ascent_time_s": time[-1] - time[bottom],
-        "total_time_s": time[-1]
+            get_max(df.bar_vx_ms,True),
+
+        "descent_time_s":
+            bottom_relative/fps,
+        "ascent_time_s":
+            (end-bottom)/fps,
+        "total_time_s":
+            (end-start)/fps,
+        "bar_tracking_pct":
+            np.isfinite(bar[:,0]).mean()*100,
+        "pelvis_valid_pct":
+            np.isfinite(pelvis[:,0]).mean()*100
     }
 
     return df, summary
 
-# ==============================
-# 1. 실험 조건
-# ==============================
+# =========================================
+# 학생 화면: 실험 조건
+# =========================================
 
-st.header("1. 실험 조건 설정")
+st.header("1. 비교 조건 설정")
 
-number_conditions = st.selectbox(
-    "비교할 조건 수",
-    [2, 3],
-    index=1
+num_conditions = st.selectbox(
+    "비교할 조건 수", [2,3], index=1
 )
 
-condition_names = []
-
-for i in range(number_conditions):
-    name = st.text_input(
+names = []
+for i in range(num_conditions):
+    names.append(st.text_input(
         f"조건 {chr(65+i)} 이름",
         value=f"조건 {chr(65+i)}",
-        key=f"name_{i}"
-    )
-    condition_names.append(name)
+        key=f"condition_{i}"
+    ))
 
 side = st.radio(
-    "분석할 다리",
-    ["right", "left"],
+    "분석할 다리 (카메라에 가까운 다리)",
+    ["right","left"],
+    horizontal=True,
     format_func=lambda x:
-        "오른쪽" if x == "right" else "왼쪽",
-    horizontal=True
+        "오른쪽" if x=="right" else "왼쪽"
 )
 
-fps_override = st.number_input(
-    "영상 FPS (0이면 영상 정보 사용)",
+length_m = st.number_input(
+    "바벨 A-B 실제 길이 (m)",
+    min_value=0.01,
+    value=1.0,
+    step=0.05
+)
+
+fps_setting = st.number_input(
+    "FPS 직접 지정 (0 = 영상 FPS)",
     min_value=0.0,
     value=0.0,
     step=10.0
 )
 
 st.info(
-    "각 영상에는 스쿼트 1회만 포함하고 "
-    "시작과 종료를 선 자세로 촬영하세요."
+    "각 영상의 앞부분에는 보정 장면이 있고, "
+    "이후 스쿼트 동작 1회가 포함되어 있다고 가정합니다."
 )
 
-# ==============================
-# 2. 거리 보정
-# ==============================
+# =========================================
+# 영상별 개별 보정 및 분석
+# =========================================
 
-st.header("2. 바벨 기준 길이 보정")
+st.header("2. 영상 업로드 및 개별 분석")
 
-st.write(
-    "보정 영상에서 실제 길이를 알고 있는 "
-    "바벨 구간의 두 점을 선택하세요."
-)
-
-calibration_file = st.file_uploader(
-    "보정 이미지 업로드",
-    type=["jpg", "jpeg", "png"],
-    key="calibration"
-)
-
-actual_length = st.number_input(
-    "선택한 구간의 실제 길이 (m)",
-    min_value=0.01,
-    value=1.0,
-    step=0.05
-)
-
-if calibration_file is not None:
-    cal_image = cv2.imdecode(
-        np.frombuffer(
-            calibration_file.getvalue(),
-            dtype=np.uint8
-        ),
-        cv2.IMREAD_COLOR
+for ci in range(num_conditions):
+    st.subheader(
+        f"조건 {chr(65+ci)}: {names[ci]}"
     )
 
-    st.write("보정점을 클릭하세요.")
-    click = pick_point(cal_image, "cal_click")
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        if st.button("첫 번째 점 A 저장"):
-            if click is not None:
-                st.session_state.cal_A = click
-
-    with c2:
-        if st.button("두 번째 점 B 저장"):
-            if click is not None:
-                st.session_state.cal_B = click
-
-    if (
-        "cal_A" in st.session_state
-        and "cal_B" in st.session_state
-    ):
-        pixels = np.linalg.norm(
-            st.session_state.cal_A
-            - st.session_state.cal_B
-        )
-
-        if pixels > 0:
-            scale = actual_length / pixels
-            st.session_state.scale = scale
-            st.session_state.cal_size = (
-                cal_image.shape[1],
-                cal_image.shape[0]
-            )
-            st.success(
-                f"보정 완료: {scale:.6f} m/pixel"
-            )
-
-st.warning(
-    "보정 길이는 촬영 시상면과 평행해야 합니다. "
-    "보정 이미지와 동작 영상의 해상도, 줌, "
-    "카메라 위치가 같아야 합니다."
-)
-
-# ==============================
-# 3. 영상 업로드 및 분석
-# ==============================
-
-st.header("3. 조건별 스쿼트 영상 분석")
-
-for ci, condition in enumerate(condition_names):
-    st.subheader(f"조건 {chr(65+ci)}: {condition}")
-
-    videos = st.file_uploader(
-        "스쿼트 영상 3개를 업로드하세요.",
-        type=["mp4", "mov"],
+    uploads = st.file_uploader(
+        "이 조건의 영상 3개 업로드",
+        type=["mp4","mov"],
         accept_multiple_files=True,
-        key=f"videos_{ci}"
+        key=f"upload_{ci}"
     )
 
-    if len(videos) != 3:
-        st.info("이 조건의 영상 3개를 선택하세요.")
+    if len(uploads) != 3:
+        st.warning("영상 3개를 업로드해 주세요.")
         continue
 
-    for trial, video in enumerate(videos, 1):
+    for trial, uploaded in enumerate(uploads,1):
+        raw_bytes = uploaded.getvalue()
+        fingerprint = hashlib.sha256(
+            raw_bytes
+        ).hexdigest()[:16]
+        suffix = os.path.splitext(
+            uploaded.name
+        )[1].lower() or ".mp4"
+
+        uid = f"{ci}_{trial}_{fingerprint}"
+
         with st.expander(
-            f"{condition} - {trial}회차",
+            f"{trial}회차: {uploaded.name}",
             expanded=False
         ):
             try:
-                frame = first_frame(video.getvalue())
-            except Exception as exc:
-                st.error(str(exc))
+                frames, native_fps = load_video(
+                    raw_bytes, suffix
+                )
+            except Exception as e:
+                st.error(str(e))
                 continue
 
-            st.write("영상에서 바벨 추적점을 클릭하세요.")
-            bar_point = pick_point(
-                frame,
-                f"bar_click_{ci}_{trial}"
+            fps = (
+                fps_setting
+                if fps_setting > 0
+                else native_fps
             )
 
-            if bar_point is not None:
-                st.write(
-                    f"선택 좌표: "
-                    f"X={bar_point[0]:.1f}, "
-                    f"Y={bar_point[1]:.1f}"
+            st.write(
+                f"전체 {len(frames)}프레임 | "
+                f"영상 FPS: {native_fps:.2f}"
+            )
+
+            st.markdown("#### A. 바벨 길이 보정")
+
+            cal_idx = st.slider(
+                "보정 장면의 프레임 선택",
+                0,len(frames)-1,0,
+                key=f"cal_idx_{uid}"
+            )
+
+            # 다른 프레임으로 바꾸면 이전 보정점 제거
+            frame_token = f"{uid}:{cal_idx}"
+            token_key = f"token_{ci}_{trial}"
+
+            if st.session_state.get(
+                token_key
+            ) != frame_token:
+                st.session_state[token_key] = frame_token
+                st.session_state.pop(f"A_{ci}_{trial}",None)
+                st.session_state.pop(f"B_{ci}_{trial}",None)
+
+            Akey = f"A_{ci}_{trial}"
+            Bkey = f"B_{ci}_{trial}"
+            A = st.session_state.get(Akey)
+            B = st.session_state.get(Bkey)
+
+            click = show_click_image(
+                frames[cal_idx],
+                f"cal_click_{uid}_{cal_idx}",
+                [
+                    ("A",A,(255,80,0)),
+                    ("B",B,(0,180,255))
+                ]
+            )
+
+            c1,c2,c3 = st.columns(3)
+
+            with c1:
+                if st.button(
+                    "A점 저장",
+                    key=f"save_A_{uid}"
+                ) and click is not None:
+                    st.session_state[Akey] = click
+                    st.rerun()
+
+            with c2:
+                if st.button(
+                    "B점 저장",
+                    key=f"save_B_{uid}"
+                ) and click is not None:
+                    st.session_state[Bkey] = click
+                    st.rerun()
+
+            with c3:
+                if st.button(
+                    "보정 초기화",
+                    key=f"reset_{uid}"
+                ):
+                    st.session_state.pop(Akey,None)
+                    st.session_state.pop(Bkey,None)
+                    st.rerun()
+
+            scale = None
+            A = st.session_state.get(Akey)
+            B = st.session_state.get(Bkey)
+
+            if A is not None and B is not None:
+                distance = np.linalg.norm(A-B)
+
+                if distance > 1:
+                    scale = length_m/distance
+                    st.success(
+                        f"A-B: {distance:.1f}px | "
+                        f"보정계수: {scale:.6f} m/pixel"
+                    )
+                else:
+                    st.error("A점과 B점을 서로 다르게 선택하세요.")
+
+            st.markdown("#### B. 스쿼트 분석 프레임")
+
+            start,end = st.slider(
+                "스쿼트 시작 및 종료 프레임",
+                0,len(frames)-1,
+                (0,len(frames)-1),
+                key=f"range_{uid}"
+            )
+
+            if end-start < 4:
+                st.warning("분석 구간이 너무 짧습니다.")
+                continue
+
+            bottom = st.slider(
+                "스쿼트 최저점 프레임",
+                start+1,end-1,
+                min(max(
+                    (start+end)//2,start+1
+                ),end-1),
+                key=f"bottom_{uid}"
+            )
+
+            preview = st.select_slider(
+                "자세 확인",
+                options=[
+                    start,bottom,end
+                ] if len(set([start,bottom,end]))==3
+                else list(range(start,end+1)),
+                value=bottom,
+                key=f"preview_{uid}"
+            )
+
+            st.image(
+                cv2.cvtColor(
+                    frames[preview],
+                    cv2.COLOR_BGR2RGB
+                ),
+                caption=f"프레임 {preview}",
+                use_container_width=False,
+                width=420
+            )
+
+            st.markdown("#### C. 바벨 추적점 지정")
+            st.caption(
+                "스쿼트 시작 프레임에서 바벨의 "
+                "추적하기 쉬운 한 점을 클릭하세요."
+            )
+
+            bar_key = f"bar_{ci}_{trial}"
+            bar_token_key = f"bar_token_{ci}_{trial}"
+            current_bar_token = f"{uid}:{start}"
+
+            if st.session_state.get(
+                bar_token_key
+            ) != current_bar_token:
+                st.session_state[bar_token_key] = (
+                    current_bar_token
                 )
+                st.session_state.pop(bar_key,None)
+
+            bar_saved = st.session_state.get(bar_key)
+
+            bar_click = show_click_image(
+                frames[start],
+                f"bar_click_{uid}_{start}",
+                [("Bar",bar_saved,(255,80,0))]
+            )
 
             if st.button(
-                "이 영상 분석하기",
-                key=f"analyze_{ci}_{trial}"
-            ):
-                if "scale" not in st.session_state:
-                    st.error("먼저 거리 보정을 완료하세요.")
-                    continue
+                "바벨 추적점 저장",
+                key=f"save_bar_{uid}"
+            ) and bar_click is not None:
+                st.session_state[bar_key] = bar_click
+                st.rerun()
 
-                if bar_point is None:
-                    st.error("바벨 위치를 클릭하세요.")
-                    continue
-
-                current_size = (
-                    frame.shape[1], frame.shape[0]
+            if bar_saved is not None:
+                st.success(
+                    f"바벨 점: X={bar_saved[0]:.1f}, "
+                    f"Y={bar_saved[1]:.1f}"
                 )
-                if current_size != st.session_state.cal_size:
-                    st.error(
-                        "보정 이미지와 영상의 해상도가 "
-                        "다릅니다. 동일 해상도로 보정하세요."
-                    )
-                    continue
 
-                with st.spinner("운동학 분석 중..."):
+            ready = (
+                scale is not None
+                and bar_saved is not None
+            )
+
+            if st.button(
+                "이 영상 운동학 분석",
+                key=f"analyze_{uid}",
+                disabled=not ready,
+                type="primary"
+            ):
+                with st.spinner("관절 및 바벨 분석 중..."):
                     try:
-                        df, summary = analyze_video(
-                            video.getvalue(),
-                            fps_override,
-                            st.session_state.scale,
-                            bar_point,
-                            side
+                        df, summary = analyze(
+                            raw_bytes,suffix,fps,scale,
+                            start,bottom,end,
+                            bar_saved,side
                         )
 
-                        summary["condition"] = condition
-                        summary["trial"] = trial
+                        summary.update({
+                            "condition":names[ci],
+                            "condition_id":ci+1,
+                            "trial":trial,
+                            "fps":fps,
+                            "scale_m_per_px":scale,
+                            "start_frame":start,
+                            "bottom_frame":bottom,
+                            "end_frame":end
+                        })
 
                         st.session_state.results[
-                            (ci, trial)
-                        ] = (df, summary)
+                            (ci,trial)
+                        ] = {
+                            "df":df,
+                            "summary":summary,
+                            "fingerprint":fingerprint,
+                            "settings":(
+                                fps,scale,start,bottom,
+                                end,tuple(bar_saved),side
+                            )
+                        }
+                        st.success("분석 완료")
+                    except Exception as e:
+                        st.error(f"분석 오류: {e}")
 
-                        st.success("분석 완료!")
+            saved = st.session_state.results.get(
+                (ci,trial)
+            )
 
-                    except Exception as exc:
-                        st.error(f"분석 오류: {exc}")
+            if saved and saved["fingerprint"]==fingerprint:
+                st.write(
+                    "마지막 분석의 바벨 추적 성공률:",
+                    f"{saved['summary']['bar_tracking_pct']:.1f}%"
+                )
 
-# ==============================
-# 4. 결과표
-# ==============================
+# =========================================
+# 결과표 및 조건별 평균 ± SD
+# =========================================
 
-st.header("4. 운동학 분석 결과")
+st.header("3. 조건별 결과")
 
-results = st.session_state.results
+valid = []
 
-valid_results = [
-    (key, df, summary)
-    for key, (df, summary) in results.items()
-    if key[0] < number_conditions
+for key, item in st.session_state.results.items():
+    ci,trial = key
+    if ci >= num_conditions:
+        continue
+
+    entry = item["summary"].copy()
+    entry["condition"] = names[ci]
+    valid.append((ci,trial,item["df"],entry))
+
+if not valid:
+    st.info("영상 분석을 완료하면 결과가 나타납니다.")
+    st.stop()
+
+summary_df = pd.DataFrame([
+    r for ci,tr,df,r in valid
+])
+
+summary_df = summary_df.sort_values(
+    ["condition_id","trial"]
+)
+
+st.subheader("개별 시행 결과")
+st.dataframe(summary_df, use_container_width=True)
+
+metric_columns = [
+    c for c in summary_df.select_dtypes(
+        include="number"
+    ).columns
+    if c not in [
+        "condition_id","trial","fps",
+        "scale_m_per_px",
+        "start_frame","bottom_frame","end_frame"
+    ]
 ]
 
-if valid_results:
-    summaries = pd.DataFrame([
-        s for _, _, s in valid_results
-    ])
+grouped = summary_df.groupby(
+    "condition",sort=False
+)[metric_columns].agg(["mean","std","count"])
 
-    st.subheader("반복별 분석 결과")
-    st.dataframe(
-        summaries.round(3),
-        use_container_width=True
+st.subheader("조건별 평균 ± 표준편차")
+st.dataframe(grouped.round(3),use_container_width=True)
+
+st.caption(
+    "조건별 SD는 각 조건의 3회 시행값에 대한 "
+    "표본 표준편차(ddof=1)입니다."
+)
+
+# =========================================
+# 조건별 막대그래프
+# =========================================
+
+st.header("4. 평균 ± SD 막대그래프")
+
+metric = st.selectbox(
+    "비교할 변수",
+    metric_columns
+)
+
+fig = go.Figure()
+colors = ["royalblue","seagreen","darkorange"]
+
+for ci,name in enumerate(names):
+    values = summary_df.loc[
+        summary_df.condition_id==ci+1,
+        metric
+    ].dropna().to_numpy()
+
+    if not len(values):
+        continue
+
+    mean = values.mean()
+    sd = (
+        values.std(ddof=1)
+        if len(values)>1 else np.nan
     )
 
-    variables = [
-        c for c in summaries.select_dtypes(
-            include="number"
-        ).columns if c != "trial"
-    ]
-
-    grouped = summaries.groupby(
-        "condition"
-    )[variables].agg(["mean", "std", "count"])
-
-    st.subheader("조건별 평균 ± SD")
-    st.dataframe(
-        grouped.round(3),
-        use_container_width=True
-    )
-
-    # ==============================
-    # 5. 평균 ± SD 막대그래프
-    # ==============================
-
-    st.header("5. 조건별 평균 ± SD 그래프")
-
-    selected_metric = st.selectbox(
-        "비교할 운동학 변수",
-        variables,
-        key="summary_metric"
-    )
-
-    fig = go.Figure()
-
-    for condition in condition_names:
-        vals = summaries.loc[
-            summaries.condition == condition,
-            selected_metric
-        ].dropna().to_numpy()
-
-        if not len(vals):
-            continue
-
-        mean = vals.mean()
-        sd = (
-            vals.std(ddof=1)
-            if len(vals) >= 2 else 0
-        )
-
-        fig.add_trace(go.Bar(
-            x=[condition],
-            y=[mean],
-            name=condition,
-            error_y=dict(
-                type="data",
-                array=[sd],
-                visible=True
-            ),
-            text=[
-                f"{mean:.2f} ± {sd:.2f}"
-            ],
-            textposition="outside"
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=[condition] * len(vals),
-            y=vals,
-            mode="markers",
-            marker=dict(
-                color="black",
-                symbol="circle-open",
-                size=10
-            ),
-            showlegend=False
-        ))
-
-    fig.update_layout(
-        title=f"{selected_metric}: Mean ± SD",
-        xaxis_title="Condition",
-        yaxis_title=selected_metric,
-        template="plotly_white",
-        height=500
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
-
-    # ==============================
-    # 6. 시간 정규화 그래프
-    # ==============================
-
-    st.header("6. 시간 정규화 그래프")
-
-    available_curves = [
-        "knee_flexion_deg",
-        "hip_segment_deg",
-        "ankle_segment_deg",
-        "trunk_inclination_deg",
-        "pelvis_x_m",
-        "pelvis_y_m",
-        "pelvis_vx_ms",
-        "pelvis_vy_ms",
-        "bar_x_m",
-        "bar_y_m",
-        "bar_vx_ms",
-        "bar_vy_ms"
-    ]
-
-    curve_metric = st.selectbox(
-        "시간에 따른 분석 변수",
-        available_curves
-    )
-
-    phase_grid = np.linspace(0, 100, 101)
-    curve_fig = go.Figure()
-
-    colors = [
-        ("rgb(45,110,210)", "rgba(45,110,210,.15)"),
-        ("rgb(30,150,100)", "rgba(30,150,100,.15)"),
-        ("rgb(220,135,40)", "rgba(220,135,40,.15)")
-    ]
-
-    for ci, condition in enumerate(condition_names):
-        curves = []
-
-        for key, df, summ in valid_results:
-            if key[0] != ci:
-                continue
-
-            x = df.phase_pct.to_numpy()
-            y = df[curve_metric].to_numpy()
-
-            good = np.isfinite(x) & np.isfinite(y)
-
-            if good.mean() < 0.90:
-                continue
-
-            curves.append(
-                np.interp(
-                    phase_grid, x[good], y[good]
-                )
-            )
-
-        if not curves:
-            continue
-
-        curves = np.array(curves)
-        mean_curve = curves.mean(axis=0)
-
-        sd_curve = (
-            curves.std(axis=0, ddof=1)
-            if len(curves) > 1
-            else np.zeros_like(mean_curve)
-        )
-
-        line_color, fill_color = colors[ci]
-
-        curve_fig.add_trace(go.Scatter(
-            x=phase_grid,
-            y=mean_curve + sd_curve,
-            mode="lines",
-            line=dict(width=0),
-            showlegend=False
-        ))
-
-        curve_fig.add_trace(go.Scatter(
-            x=phase_grid,
-            y=mean_curve - sd_curve,
-            mode="lines",
-            fill="tonexty",
-            fillcolor=fill_color,
-            line=dict(width=0),
-            showlegend=False
-        ))
-
-        curve_fig.add_trace(go.Scatter(
-            x=phase_grid,
-            y=mean_curve,
-            mode="lines",
-            name=f"{condition} (n={len(curves)})",
-            line=dict(
-                color=line_color, width=3
-            )
-        ))
-
-    curve_fig.add_vline(
-        x=50,
-        line_dash="dash",
-        line_color="gray"
-    )
-
-    curve_fig.update_layout(
-        title=f"{curve_metric}: Mean ± SD",
-        xaxis_title=(
-            "Squat phase (%) "
-            "- 0: Start, 50: Bottom, 100: End"
+    fig.add_trace(go.Bar(
+        x=[name],y=[mean],
+        name=name,
+        marker_color=colors[ci],
+        error_y=dict(
+            type="data",
+            array=[sd if np.isfinite(sd) else 0],
+            visible=True
         ),
-        yaxis_title=curve_metric,
-        template="plotly_white",
-        height=500
-    )
+        text=[
+            f"{mean:.2f} ± {sd:.2f}"
+            if np.isfinite(sd)
+            else f"{mean:.2f} (SD 없음)"
+        ],
+        textposition="outside"
+    ))
 
-    st.plotly_chart(
-        curve_fig,
-        use_container_width=True
-    )
+    fig.add_trace(go.Scatter(
+        x=[name]*len(values),
+        y=values,
+        mode="markers",
+        marker=dict(
+            color="black",
+            symbol="circle-open",
+            size=10
+        ),
+        showlegend=False
+    ))
 
-    # ==============================
-    # 7. 바벨 궤적
-    # ==============================
+fig.update_layout(
+    title=f"{metric} — Mean ± SD",
+    template="plotly_white",
+    yaxis_title=metric,
+    height=480
+)
+st.plotly_chart(fig,use_container_width=True)
 
-    st.header("7. 바벨 전후·수직 이동 궤적")
+# =========================================
+# 시간 정규화 곡선
+# =========================================
 
-    trajectory_fig = go.Figure()
+st.header("5. 시간 정규화 곡선 ± SD")
 
-    for key, df, summ in valid_results:
-        trajectory_fig.add_trace(go.Scatter(
-            x=df.bar_x_m * 100,
-            y=df.bar_y_m * 100,
-            mode="lines",
-            name=(
-                f"{summ['condition']} "
-                f"{summ['trial']}회"
-            )
-        ))
+curve_options = [
+    "knee_flexion_deg",
+    "hip_segment_deg",
+    "ankle_segment_deg",
+    "trunk_inclination_deg",
+    "pelvis_x_m","pelvis_y_m",
+    "pelvis_vx_ms","pelvis_vy_ms",
+    "bar_x_m","bar_y_m",
+    "bar_vx_ms","bar_vy_ms"
+]
 
-    trajectory_fig.update_layout(
-        xaxis_title="전후 변위 (cm)",
-        yaxis_title="수직 변위 (cm)",
-        template="plotly_white"
-    )
+curve_metric = st.selectbox(
+    "시간 정규화 변수",curve_options
+)
 
-    st.plotly_chart(
-        trajectory_fig,
-        use_container_width=True
-    )
+phase = np.linspace(0,100,101)
+curve_fig = go.Figure()
 
-    # ==============================
-    # 8. Excel 다운로드
-    # ==============================
+fills = [
+    "rgba(65,105,225,.16)",
+    "rgba(46,139,87,.16)",
+    "rgba(255,140,0,.16)"
+]
 
-    st.header("8. 분석 결과 다운로드")
+for ci,name in enumerate(names):
+    curves = []
 
-    excel_buffer = io.BytesIO()
+    for k,tr,df,r in valid:
+        if k != ci:
+            continue
 
-    with pd.ExcelWriter(
-        excel_buffer,
-        engine="openpyxl"
-    ) as writer:
+        x = df.phase_pct.to_numpy()
+        y = df[curve_metric].to_numpy()
+        good = np.isfinite(x)&np.isfinite(y)
 
-        summaries.to_excel(
-            writer, "Trial_Results", index=False
+        if good.mean()<0.9 or good.sum()<5:
+            continue
+
+        curves.append(
+            np.interp(phase,x[good],y[good])
         )
 
-        grouped.to_excel(
-            writer, "Mean_SD"
-        )
+    if not curves:
+        continue
 
-        for key, df, summ in valid_results:
-            sheet = f"C{key[0]+1}_T{key[1]}"
-            df.to_excel(
-                writer,
-                sheet_name=sheet,
-                index=False
-            )
-
-    st.download_button(
-        "Excel 분석 결과 다운로드",
-        data=excel_buffer.getvalue(),
-        file_name="Squat_Biomechanics_Results.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        )
+    curves = np.asarray(curves)
+    avg = curves.mean(axis=0)
+    sd = (
+        curves.std(axis=0,ddof=1)
+        if len(curves)>1
+        else np.zeros_like(avg)
     )
 
-else:
-    st.info(
-        "먼저 각 조건의 영상을 업로드하고 "
-        "분석 버튼을 눌러주세요."
+    curve_fig.add_trace(go.Scatter(
+        x=phase,y=avg+sd,
+        line=dict(width=0),
+        showlegend=False
+    ))
+    curve_fig.add_trace(go.Scatter(
+        x=phase,y=avg-sd,
+        line=dict(width=0),
+        fill="tonexty",
+        fillcolor=fills[ci],
+        showlegend=False
+    ))
+    curve_fig.add_trace(go.Scatter(
+        x=phase,y=avg,
+        line=dict(color=colors[ci],width=3),
+        name=f"{name} (n={len(curves)})"
+    ))
+
+curve_fig.add_vline(
+    x=50,line_dash="dash",
+    line_color="gray"
+)
+
+curve_fig.update_layout(
+    title=f"{curve_metric} — Mean ± SD",
+    xaxis_title=(
+        "Squat phase (%) | "
+        "0: 시작, 50: 최저점, 100: 종료"
+    ),
+    yaxis_title=curve_metric,
+    template="plotly_white",
+    height=500
+)
+
+st.plotly_chart(
+    curve_fig,use_container_width=True
+)
+
+# =========================================
+# 바벨 및 골반 이동 궤적
+# =========================================
+
+st.header("6. 전후·수직 이동 궤적")
+
+target = st.radio(
+    "추적 대상",
+    ["bar","pelvis"],
+    horizontal=True,
+    format_func=lambda x:
+        "바벨" if x=="bar" else "골반 중심"
+)
+
+trajectory = go.Figure()
+
+for ci,tr,df,r in valid:
+    trajectory.add_trace(go.Scatter(
+        x=df[f"{target}_x_m"]*100,
+        y=df[f"{target}_y_m"]*100,
+        mode="lines+markers",
+        marker=dict(size=3),
+        name=f"{names[ci]} {tr}회"
+    ))
+
+trajectory.update_layout(
+    xaxis_title="화면 기준 전후 변위 (cm)",
+    yaxis_title="수직 변위 (cm)",
+    template="plotly_white",
+    height=500
+)
+trajectory.update_yaxes(scaleanchor="x",scaleratio=1)
+
+st.plotly_chart(
+    trajectory,use_container_width=True
+)
+
+# =========================================
+# Excel 저장
+# =========================================
+
+st.header("7. Excel 결과 다운로드")
+
+buffer = io.BytesIO()
+
+with pd.ExcelWriter(
+    buffer,engine="openpyxl"
+) as writer:
+
+    summary_df.to_excel(
+        writer,"Trial_Results",index=False
     )
+
+    grouped.to_excel(
+        writer,"Mean_SD"
+    )
+
+    for ci,tr,df,r in valid:
+        df.to_excel(
+            writer,
+            sheet_name=f"C{ci+1}_T{tr}",
+            index=False
+        )
+
+st.download_button(
+    "전체 분석 결과 Excel 다운로드",
+    data=buffer.getvalue(),
+    file_name="Squat_Biomechanics_Results.xlsx",
+    mime=(
+        "application/vnd.openxmlformats-officedocument."
+        "spreadsheetml.sheet"
+    )
+)
+
+st.info(
+    "본 앱은 2D 영상 기반 탐색적 운동학 분석 도구입니다. "
+    "골반 중심은 전신 COM이 아니며, 정확한 거리 분석은 "
+    "보정 평면과 카메라 기하의 일치를 전제로 합니다."
+)
