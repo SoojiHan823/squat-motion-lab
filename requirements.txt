@@ -1,0 +1,10 @@
+streamlit
+streamlit-image-coordinates
+mediapipe
+opencv-python-headless
+numpy
+pandas
+scipy
+plotly
+openpyxl
+Pillow
