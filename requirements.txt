@@ -1,11 +1,11 @@
 
-streamlit==1.66.0
-streamlit-image-coordinates==0.4.1
-mediapipe==1.1.1
-opencv-python-headless==5.0.0.93
-numpy
-pandas
-scipy
-plotly
-openpyxl
-Pillow
+streamlit==1.41.1
+streamlit-image-coordinates==0.1.9
+mediapipe==0.10.21
+opencv-contrib-python-headless==4.11.0.86
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.15.2
+plotly==6.0.1
+openpyxl==3.1.5
+Pillow==11.1.0
