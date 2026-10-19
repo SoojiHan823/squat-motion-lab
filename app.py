@@ -63,15 +63,54 @@ def get_model_path():
     return MODEL_FILE
 
 
+
 # =====================================
-# 3. 영상 읽기
+# 3. 메모리 절약형 영상 읽기
 # =====================================
+
+class CompressedFrames:
+    """압축된 영상 프레임을 필요할 때만 디코딩"""
+
+    def __init__(self, buffers):
+        self.buffers = buffers
+
+    def __len__(self):
+        return len(self.buffers)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return CompressedFrames(
+                self.buffers[index]
+            )
+
+        compressed = np.frombuffer(
+            self.buffers[index],
+            dtype=np.uint8
+        )
+
+        frame = cv2.imdecode(
+            compressed,
+            cv2.IMREAD_COLOR
+        )
+
+        if frame is None:
+            raise ValueError(
+                "영상 프레임 디코딩 실패"
+            )
+
+        return frame
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
 
 @st.cache_data(
     show_spinner=False,
-    max_entries=10
+    max_entries=9
 )
-def read_video(data, extension):
+def _read_compressed_video(data, extension):
+
     with tempfile.NamedTemporaryFile(
         suffix=extension,
         delete=False
@@ -79,40 +118,81 @@ def read_video(data, extension):
         f.write(data)
         path = f.name
 
-    frames = []
     cap = cv2.VideoCapture(path)
 
+    if not cap.isOpened():
+        os.unlink(path)
+        raise ValueError("영상을 열 수 없습니다.")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 30.0
+
+    encoded_frames = []
+    MAX_FRAMES = 900
+    MAX_WIDTH = 480
+
     try:
-        if not cap.isOpened():
-            raise ValueError("영상을 열 수 없습니다.")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-
-        if not np.isfinite(fps) or fps <= 0:
-            fps = 30.0
-
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            ok, frame = cap.read()
+
+            if not ok:
                 break
 
-            frames.append(frame)
-
-            if len(frames) > 900:
+            if len(encoded_frames) >= MAX_FRAMES:
                 raise ValueError(
                     "영상이 너무 깁니다. "
-                    "15초 이내 영상으로 준비하세요."
+                    "15초 이내 영상으로 줄여주세요."
                 )
+
+            h, w = frame.shape[:2]
+
+            # 큰 영상은 메모리 절약을 위해 축소
+            if w > MAX_WIDTH:
+                new_h = max(
+                    1, round(h * MAX_WIDTH / w)
+                )
+                frame = cv2.resize(
+                    frame,
+                    (MAX_WIDTH, new_h),
+                    interpolation=cv2.INTER_AREA
+                )
+
+            # 원본 프레임 배열 대신 JPEG 압축
+            success, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 80]
+            )
+
+            if not success:
+                raise ValueError(
+                    "영상 프레임 압축 실패"
+                )
+
+            encoded_frames.append(
+                encoded.tobytes()
+            )
+
     finally:
         cap.release()
         os.unlink(path)
 
-    if len(frames) < 5:
+    if len(encoded_frames) < 5:
         raise ValueError(
             "유효한 영상 프레임이 부족합니다."
         )
 
-    return frames, float(fps)
+    return tuple(encoded_frames), float(fps)
+
+
+def read_video(data, extension):
+    buffers, fps = _read_compressed_video(
+        data, extension
+    )
+
+    return CompressedFrames(buffers), fps
 
 
 # =====================================
